@@ -150,7 +150,7 @@ async def get_hair_colour(image: np.ndarray):
 # Skin tone detection
 async def get_skin_tone(image_url: str):
     result = stone.process(image_url, image_type="color", return_report_image=True)
-    skin_tone = result["faces"][0]["skin_tone"]
+    skin_tone = result["faces"][0]["dominant_colors"][0]["color"]
     return skin_tone
 
 # Color palette generation
