@@ -11,6 +11,18 @@ from sklearn.cluster import KMeans
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import stone
+from openai import AzureOpenAI
+
+API_KEY = "f85804b527a943f197ee55b7df623528"
+API_VERSION = "2024-02-15-preview"
+AZURE_ENDPOINT = "https://embedding-model12.openai.azure.com"
+
+# Initialize the Azure OpenAI client
+client = AzureOpenAI(
+    api_key=API_KEY,
+    api_version=API_VERSION,
+    azure_endpoint=AZURE_ENDPOINT
+)
 
 app = FastAPI()
 
@@ -23,10 +35,6 @@ DESIRED_HEIGHT = 512
 DESIRED_WIDTH = 512
 mp_face_mesh = mp.solutions.face_mesh
 executor = ThreadPoolExecutor()
-
-# Models for requests
-class ImageRequest(BaseModel):
-    url: str
 
 # Utility functions
 async def download_image(url: str) -> np.ndarray:
@@ -74,11 +82,9 @@ def find_dominant_color(image, mask):
     dominant_color_rgb = cv2.cvtColor(dominant_color_lab, cv2.COLOR_LAB2RGB).reshape(3,)
     return dominant_color_rgb
 
-# API Endpoints
-@app.post("/get_iris_colour")
-async def get_iris_colour(request: ImageRequest):
-    frame = await download_image(request.url)
-    frame = cv2.flip(frame, 1)
+# Eye color detection
+async def get_iris_colour(image: np.ndarray):
+    frame = cv2.flip(image, 1)
     LEFT_IRIS = [474, 475, 476, 477]
     RIGHT_IRIS = [469, 470, 471, 472]
 
@@ -114,17 +120,12 @@ async def get_iris_colour(request: ImageRequest):
             final_color = average_color(dominant_color_left, dominant_color_right)
             final_hex_code = rgb_to_hex(final_color)
 
-            return {"eye_colour": final_hex_code}
+            return final_hex_code
         else:
-            return {"error": "No face landmarks detected."}
+            raise HTTPException(status_code=400, detail="No face landmarks detected.")
 
-
-@app.post("/get_hair_colour")
-async def get_hair_colour(request: ImageRequest):
-    image = await download_image(request.url)
-    if image is None:
-        return JSONResponse(content={"error": "Invalid image file."}, status_code=400)
-
+# Hair color detection
+async def get_hair_colour(image: np.ndarray):
     image = resize_image(image)
 
     with vision.ImageSegmenter.create_from_options(options) as segmenter:
@@ -144,35 +145,117 @@ async def get_hair_colour(request: ImageRequest):
         dominant_color = find_dominant_color(image, condition)
         dominant_color_hex = rgb_to_hex(dominant_color)
 
-        return {
-            "hair_colour": dominant_color_hex
-        }
+        return dominant_color_hex
 
-@app.post("/get_skin_tone")
-async def get_skin_tone(request: ImageRequest):
-    result = stone.process(request.url, image_type="color", return_report_image=True)
+# Skin tone detection
+async def get_skin_tone(image_url: str):
+    result = stone.process(image_url, image_type="color", return_report_image=True)
     skin_tone = result["faces"][0]["skin_tone"]
-    return {"skin_tone": skin_tone}
+    return skin_tone
 
+# Color palette generation
+def get_colour_palette(eye_colour, hair_colour, skin_tone):
+    messages = [
+        {
+            "role": "system",
+            "content": "You are an AI assistant that creates a color palette for user based on eye color, hair color, and skin tone, give to the point answer"
+        },
+        {
+            "role": "user",
+            "content": f"My eye color is {eye_colour}, my hair color is {hair_colour}, and my skin tone is {skin_tone}. Can you suggest a suitable color palette like autumn,summer,spring,winter,pls just give me short to the point answer?"
+        }
+    ]
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",  # Ensure you are using the correct model name
+            messages=messages,
+            max_tokens=100  # You can adjust this value as needed
+        )
+        palette = response.choices[0].message.content.lower()
 
-@app.post("/get_skin_analysis")
-async def get_combined_details(request: ImageRequest):
-    iris_result, hair_result, skin_tone_result = await asyncio.gather(
-        get_iris_colour(request), get_hair_colour(request), get_skin_tone(request)
-    )
+        if "autumn" in palette:
+            return autumn_palette, "autumn"
+        elif "summer" in palette:
+            return summer_palette, "summer"
+        elif "spring" in palette:
+            return spring_palette, "spring"
+        elif "winter" in palette:
+            return winter_palette, "winter"
+        else:
+            return default_palette, "default"
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get response from OpenAI. Error: {e}")
 
-    if "error" in iris_result:
-        return iris_result
-    if "error" in hair_result:
-        return hair_result
+# Color palettes
+autumn_palette = [
+    "#FF8C00",  # Dark Orange
+    "#8B0000",  # Dark Red
+    "#B8860B",  # Dark Goldenrod
+    "#6A5ACD",  # Slate Blue
+    "#DAA520"   # Goldenrod
+]
 
-    return {
-        "eye_colour": iris_result["eye_colour"],
-        "hair_colour": hair_result["hair_colour"],
-        "skin_tone": skin_tone_result["skin_tone"]
-    }
+summer_palette = [
+    "#FF6347",  # Tomato
+    "#00CED1",  # Dark Turquoise
+    "#FFD700",  # Gold
+    "#FF69B4",  # Hot Pink
+    "#87CEFA"   # Light Sky Blue
+]
 
-# To run the server, use: uvicorn <filename>:app --reload
+spring_palette = [
+    "#00FF7F",  # Spring Green
+    "#FFB6C1",  # Light Pink
+    "#FFD700",  # Gold
+    "#8A2BE2",  # Blue Violet
+    "#98FB98"   # Pale Green
+]
+
+winter_palette = [
+    "#4682B4",  # Steel Blue
+    "#1E90FF",  # Dodger Blue
+    "#FFFAFA",  # Snow White
+    "#D3D3D3",  # Light Grey
+    "#000080"   # Navy
+]
+
+default_palette = [
+    "#FF0000",  # red
+    "#008000",  # green
+    "#FFFFFF",  # White
+    "#000000",  # Black
+    "#000080"   # Navy
+]
+
+class ImageInput(BaseModel):
+    image_url: str
+
+@app.post("/detect_features")
+async def detect_features(image_input: ImageInput):
+    image_url = image_input.image_url
+    
+    try:
+        image = await download_image(image_url)
+        
+        eye_colour_hex = await get_iris_colour(image)
+        hair_colour_hex = await get_hair_colour(image)
+        skin_tone = await get_skin_tone(image_url)
+        colour_palette, season = get_colour_palette(eye_colour_hex, hair_colour_hex, skin_tone)
+
+        response = {
+            "eye_colour": eye_colour_hex,
+            "hair_colour": hair_colour_hex,
+            "skin_tone": skin_tone,
+            "colour_palette": colour_palette,
+            "season": season
+        }
+        
+        return JSONResponse(content=response)
+    
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
